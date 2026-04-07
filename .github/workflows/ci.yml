@@ -34,7 +34,14 @@ jobs:
           cache-dependency-path: requirements-test.txt
 
       - name: Install test dependencies
-        run: pip install -r requirements-test.txt
+        run: pip install -r requirements-test.txt ruff
+
+      - name: Run ruff check
+        id: ruff
+        run: |
+          ruff check . 2>&1 | tee ruff-output.txt
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
 
       - name: Run unit tests with coverage
         id: run_tests
@@ -78,8 +85,10 @@ jobs:
           script: |
             const fs = require('fs');
             const testOutput = fs.readFileSync('test-output.txt', 'utf8');
+            const ruffOutput = fs.existsSync('ruff-output.txt') ? fs.readFileSync('ruff-output.txt', 'utf8') : '';
             const coveragePct = '${{ steps.coverage.outputs.percentage }}';
             const testExitCode = '${{ steps.run_tests.outputs.exit_code }}';
+            const ruffExitCode = '${{ steps.ruff.outputs.exit_code }}';
 
             // Extract coverage table section
             const lines = testOutput.split('\n');
@@ -93,6 +102,20 @@ jobs:
 
             const testStatus  = testExitCode === '0'      ? '✅ Passed' : '❌ Failed';
             const covStatus   = parseInt(coveragePct) >= 80 ? '✅ Passed' : '❌ Failed';
+            const ruffStatus  = ruffExitCode === '0'       ? '✅ Passed' : '❌ Failed';
+
+            const ruffSection = ruffExitCode !== '0' && ruffOutput.trim()
+              ? [
+                  '<details>',
+                  `<summary><b>🔍 Ruff Output</b></summary>`,
+                  '',
+                  '```',
+                  ruffOutput.trim(),
+                  '```',
+                  '</details>',
+                  '',
+                ].join('\n')
+              : '';
 
             const body = [
               '## 🧪 Test & Quality Gate Report',
@@ -113,12 +136,14 @@ jobs:
               '```',
               '</details>',
               '',
+              ruffSection,
               '---',
               '**Quality Gates:**',
               '| Gate | Threshold | Status |',
               '|------|-----------|--------|',
               `| Unit Tests | All pass | ${testStatus} |`,
               `| Code Coverage | ≥ 80% | ${covStatus} |`,
+              `| Ruff Lint | No errors | ${ruffStatus} |`,
               '',
               `> _Workflow run: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})_`,
             ].join('\n');
@@ -156,6 +181,7 @@ jobs:
             coverage.xml
             coverage.json
             test-output.txt
+            ruff-output.txt
           retention-days: 30
 
       - name: Enforce quality gate — fail if tests failed or coverage below 80%
