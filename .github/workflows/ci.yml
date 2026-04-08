@@ -1,26 +1,53 @@
-name: Unit Tests & Quality Gates
+name: Test CICD Workflow
 
 on:
+  push:
+    branches:
+      - main
+      - develop
+      - preproduction
+    tags-ignore:
+      - '[0-9]*.[0-9]*.[0-9]*-abc*'
+      - '[0-9]*.[0-9]*.[0-9]*-pro*'
+      - '[0-9]*.[0-9]*.[0-9]*-alpha*'
+      - '[0-9]*.[0-9]*.[0-9]*-beta*'
+      - '[0-9]*.[0-9]*.[0-9]*-release*'
+      - '[0-9]*.[0-9]*.[0-9]*-zfix*'
+
   pull_request:
     branches:
       - main
-      - master
+      - develop
+      - preproduction
     types: [opened, synchronize, reopened]
 
-# Prevent duplicate runs on the same PR
+  workflow_dispatch:
+    inputs:
+      execSonar:
+        description: 'Run static code analysis'
+        required: true
+        default: false
+        type: boolean
+
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  test:
-    name: Run Unit Tests
+  quality_gates:
+    name: Unit Tests & Quality Gates
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     permissions:
       contents: read
       checks: write
       pull-requests: write
+      issues: write
+
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout code
@@ -29,132 +56,192 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-          cache: "pip"
-          cache-dependency-path: requirements-test.txt
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
 
       - name: Install test dependencies
-        run: pip install -r requirements-test.txt ruff
-
-      - name: Run ruff check
-        id: ruff
         run: |
-          ruff check . 2>&1 | tee ruff-output.txt
-          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov ruff
+
+      - name: Run ruff lint
+        id: ruff_lint
+        run: |
+          set +e
+          ruff check . --output-format=github 2>&1 | tee ruff-output.txt
+          exit_code=${PIPESTATUS[0]}
+          set -e
+          echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      - name: Run ruff format check
+        id: ruff_format
+        run: |
+          set +e
+          ruff format --check . 2>&1 | tee ruff-format-output.txt
+          exit_code=${PIPESTATUS[0]}
+          set -e
+          echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
         continue-on-error: true
 
       - name: Run unit tests with coverage
         id: run_tests
         run: |
-          python -m pytest tests/ \
+          set +e
+          python -m pytest -q -ra -o addopts='' tests/unit \
             --cov=src \
             --cov-report=term-missing \
             --cov-report=xml:coverage.xml \
             --cov-report=json:coverage.json \
             --cov-fail-under=80 \
-            --junitxml=test-results.xml \
-            -v 2>&1 | tee test-output.txt
-          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+            --junitxml=test-results.xml 2>&1 | tee test-output.txt
+          exit_code=${PIPESTATUS[0]}
+          set -e
+          echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
         continue-on-error: true
 
       - name: Extract coverage percentage
         id: coverage
+        if: always()
         run: |
-          COVERAGE=$(python -c "
-          import json
-          with open('coverage.json') as f:
-              data = json.load(f)
-          pct = data['totals']['percent_covered_display']
-          print(pct)
-          ")
-          echo "percentage=${COVERAGE}" >> "$GITHUB_OUTPUT"
+          COVERAGE=$(python -c "import json, pathlib; p=pathlib.Path('coverage.json'); print((json.load(p.open()).get('totals', {}).get('percent_covered_display', 0)) if p.exists() else 0)")
+          echo "percentage=$COVERAGE" >> "$GITHUB_OUTPUT"
 
       - name: Publish test results
         uses: EnricoMi/publish-unit-test-result-action@v2
-        if: always()
+        if: always() && hashFiles('test-results.xml') != ''
+        continue-on-error: true
         with:
           files: test-results.xml
-          comment_title: "🧪 Unit Test Results"
-          check_name: "Unit Test Results"
-          fail_on: "test failures"
+          comment_title: 'Unit Test Results'
+          check_name: 'Unit Test Results'
+          fail_on: 'test failures'
 
-      - name: Post coverage & quality gate summary as PR comment
-        uses: actions/github-script@v7
+      - name: Publish workflow summary
         if: always()
+        run: |
+          TEST_STATUS="✅ Passed"
+          LINT_STATUS="✅ Passed"
+          FORMAT_STATUS="✅ Passed"
+          COVERAGE_STATUS="✅ Passed"
+
+          COVERAGE="${{ steps.coverage.outputs.percentage }}"
+          COVERAGE="${COVERAGE:-0}"
+
+          [ "${{ steps.run_tests.outputs.exit_code }}" = "0" ] || TEST_STATUS="❌ Failed"
+          [ "${{ steps.ruff_lint.outputs.exit_code }}" = "0" ] || LINT_STATUS="❌ Failed"
+          [ "${{ steps.ruff_format.outputs.exit_code }}" = "0" ] || FORMAT_STATUS="❌ Failed"
+
+          python -c "import sys; sys.exit(0 if float('$COVERAGE') >= 80 else 1)" \
+            || COVERAGE_STATUS="❌ Failed"
+
+          {
+            echo "## Test & Quality Gate Report"
+            echo ""
+            echo "| Gate | Threshold | Status |"
+            echo "|------|-----------|--------|"
+            echo "| Unit Tests | All pass | $TEST_STATUS |"
+            echo "| Code Coverage | >= 80% | $COVERAGE_STATUS |"
+            echo "| Ruff Lint | No errors | $LINT_STATUS |"
+            echo "| Ruff Format | No changes required | $FORMAT_STATUS |"
+            echo ""
+            echo "Coverage detected: **${COVERAGE}%**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post coverage and quality gate summary as PR comment
+        uses: actions/github-script@v7
+        if: always() && github.event_name == 'pull_request'
+        continue-on-error: true
         with:
           script: |
             const fs = require('fs');
-            const testOutput = fs.readFileSync('test-output.txt', 'utf8');
-            const ruffOutput = fs.existsSync('ruff-output.txt') ? fs.readFileSync('ruff-output.txt', 'utf8') : '';
-            const coveragePct = '${{ steps.coverage.outputs.percentage }}';
-            const testExitCode = '${{ steps.run_tests.outputs.exit_code }}';
-            const ruffExitCode = '${{ steps.ruff.outputs.exit_code }}';
 
-            // Extract coverage table section
-            const lines = testOutput.split('\n');
-            const coverageStart = lines.findIndex(l => l.includes('coverage: platform'));
-            const coverageSection = coverageStart >= 0
-              ? lines.slice(coverageStart, coverageStart + 20).join('\n')
-              : 'Coverage report not available.';
-
-            // Last 60 lines of test output for full review
-            const fullOutput = lines.slice(-60).join('\n');
-
-            const testStatus  = testExitCode === '0'      ? '✅ Passed' : '❌ Failed';
-            const covStatus   = parseInt(coveragePct) >= 80 ? '✅ Passed' : '❌ Failed';
-            const ruffStatus  = ruffExitCode === '0'       ? '✅ Passed' : '❌ Failed';
-
-            const ruffSection = ruffExitCode !== '0' && ruffOutput.trim()
-              ? [
-                  '<details>',
-                  `<summary><b>🔍 Ruff Output</b></summary>`,
-                  '',
-                  '```',
-                  ruffOutput.trim(),
-                  '```',
-                  '</details>',
-                  '',
-                ].join('\n')
+            const testOutput = fs.existsSync('test-output.txt')
+              ? fs.readFileSync('test-output.txt', 'utf8')
+              : 'Test output not available.';
+            const ruffOutput = fs.existsSync('ruff-output.txt')
+              ? fs.readFileSync('ruff-output.txt', 'utf8')
+              : '';
+            const ruffFormatOutput = fs.existsSync('ruff-format-output.txt')
+              ? fs.readFileSync('ruff-format-output.txt', 'utf8')
               : '';
 
+            const coveragePct = '${{ steps.coverage.outputs.percentage }}' || '0';
+            const testExitCode = '${{ steps.run_tests.outputs.exit_code }}';
+            const ruffLintExitCode = '${{ steps.ruff_lint.outputs.exit_code }}';
+            const ruffFormatExitCode = '${{ steps.ruff_format.outputs.exit_code }}';
+
+            const lines = testOutput.split('\n');
+            const fullOutput = lines.slice(-80).join('\n');
+
+            const testStatus = testExitCode === '0' ? '✅ Passed' : '❌ Failed';
+            const covStatus = parseFloat(coveragePct) >= 80 ? '✅ Passed' : '❌ Failed';
+            const ruffLintStatus = ruffLintExitCode === '0' ? '✅ Passed' : '❌ Failed';
+            const ruffFormatStatus = ruffFormatExitCode === '0' ? '✅ Passed' : '❌ Failed';
+
             const body = [
-              '## 🧪 Test & Quality Gate Report',
+              '## Test & Quality Gate Report',
               '',
-              '<details>',
-              `<summary><b>📊 Coverage Summary — ${coveragePct}%</b> (minimum required: 80%)</summary>`,
+              `**Coverage:** ${coveragePct}%`,
               '',
-              '```',
-              coverageSection,
-              '```',
-              '</details>',
-              '',
-              '<details>',
-              '<summary><b>📋 Full Test Output</b></summary>',
-              '',
-              '```',
-              fullOutput,
-              '```',
-              '</details>',
-              '',
-              ruffSection,
-              '---',
-              '**Quality Gates:**',
               '| Gate | Threshold | Status |',
               '|------|-----------|--------|',
               `| Unit Tests | All pass | ${testStatus} |`,
-              `| Code Coverage | ≥ 80% | ${covStatus} |`,
-              `| Ruff Lint | No errors | ${ruffStatus} |`,
+              `| Code Coverage | >= 80% | ${covStatus} |`,
+              `| Ruff Lint | No errors | ${ruffLintStatus} |`,
+              `| Ruff Format | No changes required | ${ruffFormatStatus} |`,
               '',
-              `> _Workflow run: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})_`,
+              '<details>',
+              '<summary><b>Full Test Output</b></summary>',
+              '',
+              '```',
+              fullOutput || 'No test output available.',
+              '```',
+              '</details>',
+              '',
+              ...(ruffLintExitCode !== '0' && ruffOutput.trim()
+                ? [
+                    '<details>',
+                    '<summary><b>Ruff Lint Output</b></summary>',
+                    '',
+                    '```',
+                    ruffOutput.trim(),
+                    '```',
+                    '</details>',
+                    '',
+                  ]
+                : []),
+              ...(ruffFormatExitCode !== '0' && ruffFormatOutput.trim()
+                ? [
+                    '<details>',
+                    '<summary><b>Ruff Format Output</b></summary>',
+                    '',
+                    '```',
+                    ruffFormatOutput.trim(),
+                    '```',
+                    '</details>',
+                    '',
+                  ]
+                : []),
+              '---',
+              `> Workflow run: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`,
             ].join('\n');
 
-            const marker = '## 🧪 Test & Quality Gate Report';
-            const { data: comments } = await github.rest.issues.listComments({
+            const marker = '## Test & Quality Gate Report';
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
+              per_page: 100,
             });
-            const existing = comments.find(c => c.user.type === 'Bot' && c.body.includes(marker));
+
+            const existing = comments.find(
+              comment => comment.user.type === 'Bot' && comment.body.includes(marker)
+            );
+
             if (existing) {
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,
@@ -182,11 +269,31 @@ jobs:
             coverage.json
             test-output.txt
             ruff-output.txt
+            ruff-format-output.txt
+          if-no-files-found: ignore
           retention-days: 30
 
-      - name: Enforce quality gate — fail if tests failed or coverage below 80%
-        if: steps.run_tests.outputs.exit_code != '0'
+      - name: Enforce quality gate
+        if: always()
         run: |
-          echo "❌ Quality gate failed: unit tests or coverage threshold not met."
-          echo "Review the test output and coverage report above."
-          exit 1
+          failed=0
+
+          if [ "${{ steps.ruff_lint.outputs.exit_code }}" != "0" ]; then
+            echo "Ruff lint failed."
+            failed=1
+          fi
+
+          if [ "${{ steps.ruff_format.outputs.exit_code }}" != "0" ]; then
+            echo "Ruff format check failed."
+            failed=1
+          fi
+
+          if [ "${{ steps.run_tests.outputs.exit_code }}" != "0" ]; then
+            echo "Unit tests or coverage threshold failed."
+            failed=1
+          fi
+
+          if [ "$failed" -ne 0 ]; then
+            echo "Quality gate failed. Review the workflow summary, PR comment, or uploaded artifacts for details."
+            exit 1
+          fi
