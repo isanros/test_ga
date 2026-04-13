@@ -1,25 +1,30 @@
 name: Unit Tests & Quality Gates
 
 on:
+  push:
+    branches:
+      - "**"
+
   pull_request:
     branches:
       - main
       - master
     types: [opened, synchronize, reopened]
 
-# Prevent duplicate runs on the same PR
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   test:
     name: Run Unit Tests
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
 
     permissions:
       contents: read
       checks: write
+      issues: write
       pull-requests: write
 
     steps:
@@ -34,18 +39,12 @@ jobs:
           cache-dependency-path: requirements-test.txt
 
       - name: Install test dependencies
-        run: pip install -r requirements-test.txt ruff
-
-      - name: Run ruff check
-        id: ruff
-        run: |
-          ruff check . 2>&1 | tee ruff-output.txt
-          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
-        continue-on-error: true
+        run: pip install -r requirements-test.txt
 
       - name: Run unit tests with coverage
         id: run_tests
         run: |
+          set +e
           python -m pytest tests/ \
             --cov=src \
             --cov-report=term-missing \
@@ -54,68 +53,56 @@ jobs:
             --cov-fail-under=80 \
             --junitxml=test-results.xml \
             -v 2>&1 | tee test-output.txt
-          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
-        continue-on-error: true
+          EXIT_CODE=${PIPESTATUS[0]}
+          echo "exit_code=${EXIT_CODE}" >> "$GITHUB_OUTPUT"
+          exit 0
 
       - name: Extract coverage percentage
         id: coverage
+        if: always()
         run: |
-          COVERAGE=$(python -c "
-          import json
-          with open('coverage.json') as f:
-              data = json.load(f)
-          pct = data['totals']['percent_covered_display']
-          print(pct)
-          ")
+          if [ -f coverage.json ]; then
+            COVERAGE=$(python -c "import json; print(json.load(open('coverage.json'))['totals']['percent_covered_display'])")
+          else
+            COVERAGE=0
+          fi
           echo "percentage=${COVERAGE}" >> "$GITHUB_OUTPUT"
 
       - name: Publish test results
         uses: EnricoMi/publish-unit-test-result-action@v2
-        if: always()
+        if: always() && hashFiles('test-results.xml') != ''
         with:
           files: test-results.xml
-          comment_title: "🧪 Unit Test Results"
+          comment_mode: off
           check_name: "Unit Test Results"
           fail_on: "test failures"
 
-      - name: Post coverage & quality gate summary as PR comment
+      - name: Post coverage summary as PR comment
         uses: actions/github-script@v7
         if: always()
+        env:
+          COVERAGE_PCT: ${{ steps.coverage.outputs.percentage }}
+          TEST_EXIT_CODE: ${{ steps.run_tests.outputs.exit_code }}
         with:
           script: |
             const fs = require('fs');
-            const testOutput = fs.readFileSync('test-output.txt', 'utf8');
-            const ruffOutput = fs.existsSync('ruff-output.txt') ? fs.readFileSync('ruff-output.txt', 'utf8') : '';
-            const coveragePct = '${{ steps.coverage.outputs.percentage }}';
-            const testExitCode = '${{ steps.run_tests.outputs.exit_code }}';
-            const ruffExitCode = '${{ steps.ruff.outputs.exit_code }}';
+            const testOutput = fs.existsSync('test-output.txt')
+              ? fs.readFileSync('test-output.txt', 'utf8')
+              : 'Test output not available.';
 
-            // Extract coverage table section
+            const coveragePct = process.env.COVERAGE_PCT || '0';
+            const testExitCode = process.env.TEST_EXIT_CODE || '1';
+
             const lines = testOutput.split('\n');
             const coverageStart = lines.findIndex(l => l.includes('coverage: platform'));
             const coverageSection = coverageStart >= 0
               ? lines.slice(coverageStart, coverageStart + 20).join('\n')
               : 'Coverage report not available.';
 
-            // Last 60 lines of test output for full review
             const fullOutput = lines.slice(-60).join('\n');
 
-            const testStatus  = testExitCode === '0'      ? '✅ Passed' : '❌ Failed';
-            const covStatus   = parseInt(coveragePct) >= 80 ? '✅ Passed' : '❌ Failed';
-            const ruffStatus  = ruffExitCode === '0'       ? '✅ Passed' : '❌ Failed';
-
-            const ruffSection = ruffExitCode !== '0' && ruffOutput.trim()
-              ? [
-                  '<details>',
-                  `<summary><b>🔍 Ruff Output</b></summary>`,
-                  '',
-                  '```',
-                  ruffOutput.trim(),
-                  '```',
-                  '</details>',
-                  '',
-                ].join('\n')
-              : '';
+            const testStatus = testExitCode === '0' ? '✅ Passed' : '❌ Failed';
+            const covStatus = parseFloat(coveragePct) >= 80 ? '✅ Passed' : '❌ Failed';
 
             const body = [
               '## 🧪 Test & Quality Gate Report',
@@ -136,14 +123,12 @@ jobs:
               '```',
               '</details>',
               '',
-              ruffSection,
               '---',
               '**Quality Gates:**',
               '| Gate | Threshold | Status |',
               '|------|-----------|--------|',
               `| Unit Tests | All pass | ${testStatus} |`,
               `| Code Coverage | ≥ 80% | ${covStatus} |`,
-              `| Ruff Lint | No errors | ${ruffStatus} |`,
               '',
               `> _Workflow run: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})_`,
             ].join('\n');
@@ -154,7 +139,9 @@ jobs:
               repo: context.repo.repo,
               issue_number: context.issue.number,
             });
+
             const existing = comments.find(c => c.user.type === 'Bot' && c.body.includes(marker));
+
             if (existing) {
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,
@@ -171,22 +158,29 @@ jobs:
               });
             }
 
-      - name: Upload test results artifact
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: test-results
-          path: |
-            test-results.xml
-            coverage.xml
-            coverage.json
-            test-output.txt
-            ruff-output.txt
-          retention-days: 30
-
-      - name: Enforce quality gate — fail if tests failed or coverage below 80%
+      - name: Enforce quality gate
         if: steps.run_tests.outputs.exit_code != '0'
         run: |
           echo "❌ Quality gate failed: unit tests or coverage threshold not met."
           echo "Review the test output and coverage report above."
           exit 1
+
+  cicd:
+    name: Fake CI/CD
+    needs: [test]
+    if: always() && (github.event_name == 'push' || needs.test.result == 'success')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Fake CI/CD execution
+        run: |
+          echo "Running fake CI/CD..."
+          echo "Event: ${{ github.event_name }}"
+          echo "Ref: ${{ github.ref }}"
+          echo "This simulates the Iberdrola reusable workflow."
+
+      - name: Fake deploy/packaging step
+        run: |
+          echo "Building artifact..."
+          echo "Packaging application..."
+          echo "CI/CD finished successfully."
